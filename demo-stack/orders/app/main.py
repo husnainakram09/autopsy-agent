@@ -46,7 +46,13 @@ logger = logging.getLogger("orders")
 DATABASE_URL = os.getenv(
     "DATABASE_URL", "postgresql+psycopg://orders:orders@localhost:5432/orders"
 )
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    pool_size=20,
+    max_overflow=0,
+    pool_timeout=2,
+)
 
 
 class Order(SQLModel, table=True):
