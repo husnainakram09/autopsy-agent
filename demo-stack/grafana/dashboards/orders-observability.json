@@ -1,0 +1,36 @@
+{
+  "annotations": {"list": []},
+  "editable": false,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Request rate (req/s)",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [{"expr": "sum(rate(http_requests_total{job=\"orders\"}[5m]))", "legendFormat": "requests/s", "refId": "A"}],
+      "fieldConfig": {"defaults": {"unit": "reqps"}, "overrides": []}
+    },
+    {
+      "type": "timeseries",
+      "title": "Error rate", 
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "targets": [{"expr": "100 * sum(rate(http_requests_total{job=\"orders\",status=~\"4..|5..\"}[5m])) / sum(rate(http_requests_total{job=\"orders\"}[5m]))", "legendFormat": "errors %", "refId": "A"}],
+      "fieldConfig": {"defaults": {"unit": "percent"}, "overrides": []}
+    },
+    {
+      "type": "timeseries",
+      "title": "p95 latency",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8},
+      "targets": [{"expr": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{job=\"orders\"}[5m])))", "legendFormat": "p95", "refId": "A"}],
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []}
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["orders", "observability"],
+  "templating": {"list": []},
+  "time": {"from": "now-15m", "to": "now"},
+  "title": "Orders Service Observability",
+  "uid": "orders-observability",
+  "version": 1
+}
+
