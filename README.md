@@ -59,3 +59,21 @@ docker compose up --build
 Open Grafana and select the pre-provisioned **Orders Service Observability** dashboard. It includes request rate, error rate, and p95 latency panels backed by Prometheus. Logs are available through the provisioned Loki data source using the Explore view.
 
 Stop the stack with `Ctrl+C`, or run `docker compose down`. Add `-v` to remove the Postgres, Prometheus, Loki, and Grafana volumes as well.
+
+### Incident drill: N+1 query and pool exhaustion
+
+The repository includes an intentionally faulty branch, `incident/n-plus-one`. The branch adds an N+1 query pattern to `GET /orders` and reduces the orders database pool to three connections so the existing load generator can produce latency spikes and pool timeouts.
+
+From a Git Bash shell with Docker running:
+
+```bash
+./scripts/trigger_incident.sh
+```
+
+That checks out `main`, merges the incident branch, and rebuilds the orders and loadgen containers. Use the provisioned Grafana dashboard and container logs to observe the impact. Resolve and redeploy with:
+
+```bash
+./scripts/resolve_incident.sh
+```
+
+The resolve script reverts the incident merge commit and rebuilds the affected containers. These scripts expect a clean working tree because they switch to `main` before merging or reverting.
