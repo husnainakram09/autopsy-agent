@@ -46,7 +46,14 @@ logger = logging.getLogger("orders")
 DATABASE_URL = os.getenv(
     "DATABASE_URL", "postgresql+psycopg://orders:orders@localhost:5432/orders"
 )
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+# INCIDENT: intentionally constrained from the normal 20 connections.
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    pool_size=3,
+    max_overflow=0,
+    pool_timeout=2,
+)
 
 
 class Order(SQLModel, table=True):
@@ -57,6 +64,13 @@ class Order(SQLModel, table=True):
     status: str = "pending"
     total_cents: int
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class OrderItem(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    order_id: int = Field(foreign_key="order.id", index=True)
+    sku: str
+    quantity: int = Field(gt=0)
 
 
 class OrderCreate(SQLModel):
@@ -121,13 +135,25 @@ def create_order(payload: OrderCreate, session: SessionDep) -> Order:
     session.add(order)
     session.commit()
     session.refresh(order)
+    for _ in range(payload.quantity):
+        session.add(OrderItem(order_id=order.id, sku=payload.product_id, quantity=1))
+    session.commit()
     logger.info("order created id=%s quantity=%s", order.id, order.quantity)
     return order
 
 
 @app.get("/orders", response_model=list[Order])
 def list_orders(session: SessionDep, limit: int = 50, offset: int = 0) -> list[Order]:
-    return list(session.exec(select(Order).offset(offset).limit(min(limit, 100))).all())
+    orders = list(session.exec(select(Order).offset(offset).limit(min(limit, 100))).all())
+    # INCIDENT: this deliberately performs a separate detail query for every
+    # item rather than loading items with the orders in one joined query.
+    for order in orders:
+        item_ids = session.exec(
+            select(OrderItem.id).where(OrderItem.order_id == order.id)
+        ).all()
+        for item_id in item_ids:
+            session.exec(select(OrderItem).where(OrderItem.id == item_id)).one()
+    return orders
 
 
 @app.get("/orders/{order_id}", response_model=Order)
@@ -152,6 +178,9 @@ def checkout(payload: CheckoutRequest, session: SessionDep) -> Order:
             total_cents=random.randint(1200, 9500) * payload.quantity,
         )
         session.add(order)
+        session.flush()
+        for _ in range(payload.quantity):
+            session.add(OrderItem(order_id=order.id, sku=payload.product_id, quantity=1))
     order.status = "checked_out"
     session.commit()
     session.refresh(order)
