@@ -93,7 +93,8 @@ SessionDep = Annotated[Session, Depends(get_session)]
 async def lifespan(_: FastAPI):
     global downstream_client
     SQLModel.metadata.create_all(engine)
-    downstream_client = httpx.Client(base_url=DOWNSTREAM_URL, timeout=2.0)
+    # INCIDENT: this is intentionally shorter than normal dependency variance.
+    downstream_client = httpx.Client(base_url=DOWNSTREAM_URL, timeout=0.1)
     logger.info("orders service started")
     yield
     if downstream_client is not None:
