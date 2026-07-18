@@ -13,14 +13,23 @@ services:
       timeout: 5s
       retries: 10
 
+  inventory:
+    build: ./downstream
+    environment:
+      LATENCY_MIN_MS: "50"
+      LATENCY_MAX_MS: "180"
+
   orders:
     build: ./orders
     environment:
       DATABASE_URL: postgresql+psycopg://orders:orders@postgres:5432/orders
+      DOWNSTREAM_URL: http://inventory:8000
       LOG_LEVEL: INFO
     depends_on:
       postgres:
         condition: service_healthy
+      inventory:
+        condition: service_started
     ports:
       - "8001:8000"
     labels:
@@ -87,4 +96,3 @@ volumes:
   prometheus-data:
   loki-data:
   grafana-data:
-
