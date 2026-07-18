@@ -84,3 +84,15 @@ That checks out `main`, merges the incident branch, and rebuilds the orders and 
 ```
 
 The resolve script reverts the incident merge commit and rebuilds the affected containers. These scripts expect a clean working tree because they switch to `main` before merging or reverting.
+
+### Incident drill: downstream timeout
+
+The `incident/bad-timeout` branch adds an inventory dependency with normal 50–180ms latency variance, then intentionally constrains the orders client timeout to 100ms. This produces intermittent `502` responses without the database query amplification and pool pressure characteristic of `incident/n-plus-one`.
+
+```bash
+git checkout incident/bad-timeout
+cd demo-stack
+docker compose up --build
+```
+
+The agent should identify the timeout by correlating `502` responses and downstream latency with the `timeout=0.1` code diff. It should not label the incident N+1: that scenario requires query growth/pool pressure evidence and an item-by-item database access diff.

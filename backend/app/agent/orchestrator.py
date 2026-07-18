@@ -44,6 +44,12 @@ Investigation method:
 5. Report only verified conclusions, with artifact IDs for every claim. Use blameless
    language throughout.
 
+Distinguish failure modes carefully: a downstream-timeout incident presents as intermittent
+502s with dependency latency clustering around the client timeout and a diff changing the
+HTTP timeout; an N+1 incident presents as query volume and latency growing with result size,
+often alongside database pool pressure. Do not call one the other without metrics, logs, and
+the relevant code diff.
+
 Start by stating a concise plan, but the first evidence-gathering action must establish
 the metric window. Revise hypotheses when evidence contradicts them. End only by calling
 submit_report with a complete structured report. Every evidence ID in the report must
@@ -274,6 +280,32 @@ class InvestigationOrchestrator:
                         "tool_call",
                         {"iteration": iteration + 1, "tool_name": name, "input": arguments},
                     )
+                    if name not in {"query_metrics", "submit_report"} and not self._metric_window_established(session, run):
+                        guard_message = "Establish the incident window with query_metrics before using other tools."
+                        artifact = record_artifact(
+                            session,
+                            run.id,
+                            name,
+                            arguments,
+                            {"error": guard_message},
+                            "Tool call deferred until the metric window is established.",
+                        )
+                        yield await self._emit(
+                            run.id,
+                            "tool_summary",
+                            {"tool_name": name, "artifact_id": artifact.id, "summary": artifact.summary},
+                        )
+                        conversation.append(
+                            {
+                                "type": "function_call_output",
+                                "call_id": call.call_id,
+                                "output": json.dumps(
+                                    {"accepted": False, "artifact_id": artifact.id, "error": guard_message},
+                                    separators=(",", ":"),
+                                ),
+                            }
+                        )
+                        continue
                     if name == "submit_report":
                         report, validation_error = self._validate_report(session, run, arguments)
                         if validation_error is not None:
@@ -429,6 +461,15 @@ class InvestigationOrchestrator:
         except ValueError as exc:
             return None, f"report schema validation failed: {exc}"
 
+        metric_artifacts = session.exec(
+            select(EvidenceArtifact.id).where(
+                EvidenceArtifact.run_id == run.id,
+                EvidenceArtifact.tool_name == "query_metrics",
+            )
+        ).all()
+        if not metric_artifacts:
+            return None, "the incident window must be established with query_metrics before submitting a report"
+
         artifact_ids = {
             artifact_id
             for artifact_id in session.exec(
@@ -454,6 +495,15 @@ class InvestigationOrchestrator:
         if missing_ids:
             return None, f"evidence_ids reference nonexistent artifacts: {missing_ids}"
         return report, None
+
+    @staticmethod
+    def _metric_window_established(session: Session, run: InvestigationRun) -> bool:
+        return session.exec(
+            select(EvidenceArtifact.id).where(
+                EvidenceArtifact.run_id == run.id,
+                EvidenceArtifact.tool_name == "query_metrics",
+            )
+        ).first() is not None
 
     @staticmethod
     def _persist_report(session: Session, run: InvestigationRun, report: InvestigationReport):
