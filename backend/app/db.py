@@ -2,6 +2,8 @@ from pathlib import Path
 
 from sqlmodel import SQLModel, Session, create_engine
 
+from . import models  # noqa: F401  # Register all SQLModel tables before create_all.
+
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
@@ -21,4 +23,3 @@ def create_db_and_tables() -> None:
 def get_session():
     with Session(engine) as session:
         yield session
-
