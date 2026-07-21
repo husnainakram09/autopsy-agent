@@ -24,6 +24,12 @@ cd backend && uv sync
 cd ../frontend && npm install
 ```
 
+Run the backend tests:
+
+```bash
+cd backend && uv run pytest
+```
+
 Run both development servers from the repository root:
 
 ```bash
@@ -37,6 +43,7 @@ The SQLite database is created at `backend/data/app.db` when the backend starts.
 ## API
 
 - `GET /health` — returns `{ "status": "ok" }`
+- `GET /runs/{id}/stream` — streams investigation events as SSE; reconnects replay buffered events and honor `Last-Event-ID`.
 
 ## Observability demo stack
 

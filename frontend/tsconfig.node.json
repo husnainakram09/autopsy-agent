@@ -3,6 +3,7 @@
     "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.node.tsbuildinfo",
     "target": "ES2022",
     "lib": ["ES2023"],
+    "types": ["node"],
     "module": "ESNext",
     "skipLibCheck": true,
     "moduleResolution": "Bundler",
@@ -14,4 +15,3 @@
   },
   "include": ["vite.config.ts"]
 }
-
