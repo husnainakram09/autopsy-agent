@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
+import httpx
 from prometheus_fastapi_instrumentator import Instrumentator
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 
@@ -54,6 +55,8 @@ engine = create_engine(
     max_overflow=0,
     pool_timeout=2,
 )
+DOWNSTREAM_URL = os.getenv("DOWNSTREAM_URL", "http://inventory:8000")
+downstream_client: httpx.Client | None = None
 
 
 class Order(SQLModel, table=True):
@@ -96,9 +99,14 @@ SessionDep = Annotated[Session, Depends(get_session)]
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    global downstream_client
     SQLModel.metadata.create_all(engine)
+    # INCIDENT: this is intentionally shorter than normal dependency variance.
+    downstream_client = httpx.Client(base_url=DOWNSTREAM_URL, timeout=0.1)
     logger.info("orders service started")
     yield
+    if downstream_client is not None:
+        downstream_client.close()
     logger.info("orders service stopped")
 
 
@@ -126,6 +134,17 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+def check_inventory(product_id: str) -> None:
+    if downstream_client is None:
+        return
+    try:
+        response = downstream_client.get(f"/inventory/{product_id}")
+        response.raise_for_status()
+    except (httpx.TimeoutException, httpx.HTTPError) as exc:
+        logger.error("inventory dependency failed product_id=%s error=%s", product_id, exc)
+        raise HTTPException(status_code=502, detail="Inventory dependency unavailable") from exc
+
+
 @app.post("/orders", response_model=Order, status_code=status.HTTP_201_CREATED)
 def create_order(payload: OrderCreate, session: SessionDep) -> Order:
     order = Order(
@@ -145,14 +164,8 @@ def create_order(payload: OrderCreate, session: SessionDep) -> Order:
 @app.get("/orders", response_model=list[Order])
 def list_orders(session: SessionDep, limit: int = 50, offset: int = 0) -> list[Order]:
     orders = list(session.exec(select(Order).offset(offset).limit(min(limit, 100))).all())
-    # INCIDENT: this deliberately performs a separate detail query for every
-    # item rather than loading items with the orders in one joined query.
-    for order in orders:
-        item_ids = session.exec(
-            select(OrderItem.id).where(OrderItem.order_id == order.id)
-        ).all()
-        for item_id in item_ids:
-            session.exec(select(OrderItem).where(OrderItem.id == item_id)).one()
+    if orders:
+        check_inventory(orders[0].product_id)
     return orders
 
 

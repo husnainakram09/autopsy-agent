@@ -1,0 +1,14 @@
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: autopsy-agent
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 1h
+
+receivers:
+  - name: autopsy-agent
+    webhook_configs:
+      - url: http://host.docker.internal:8000/webhooks/alertmanager
+        send_resolved: false

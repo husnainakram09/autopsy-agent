@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
+import { Component, useEffect, useMemo, useState } from "react";
+import type { ErrorInfo, ReactNode } from "react";
 import type { LucideIcon } from "lucide-react";
 import {
   Activity,
@@ -91,12 +92,26 @@ type Report = {
 };
 
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_URL}${path}`, {
-    headers: { "Content-Type": "application/json" },
-    ...options,
-  });
-  if (!response.ok) throw new Error((await response.text()) || `Request failed (${response.status})`);
-  return response.json() as Promise<T>;
+  const method = options?.method?.toUpperCase() ?? "GET";
+  const retryable = method === "GET" || method === "HEAD";
+  let lastError: Error = new Error("Request failed");
+  for (let attempt = 0; attempt < (retryable ? 3 : 1); attempt += 1) {
+    try {
+      const response = await fetch(`${API_URL}${path}`, {
+        headers: { "Content-Type": "application/json" },
+        ...options,
+      });
+      if (response.ok) return response.json() as Promise<T>;
+      const message = (await response.text()) || `Request failed (${response.status})`;
+      if (response.status < 500 || attempt === 2) throw new Error(message);
+      lastError = new Error(message);
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error("Network request failed");
+      if (!retryable || attempt === 2) throw lastError;
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 300 * 2 ** attempt));
+  }
+  throw lastError;
 }
 
 function formatDate(value?: string | null) {
@@ -219,7 +234,7 @@ function IncidentDetail({ incidentId, onBack }: { incidentId: number; onBack: ()
     if (!run) return;
     api<Artifact[]>(`/runs/${run.id}/artifacts`).then(setArtifacts).catch(() => undefined);
     const source = new EventSource(`${API_URL}/runs/${run.id}/stream`);
-    const eventNames = ["step_started", "tool_call", "tool_result_summary", "hypothesis_update", "report_ready", "report_rejected", "run_failed"];
+    const eventNames = ["step_started", "tool_call", "tool_result_summary", "tool_timeout", "context_compacted", "hypothesis_update", "report_ready", "report_rejected", "run_failed"];
     const onEvent = (event: Event) => {
       const message = event as MessageEvent<string>;
       const data = JSON.parse(message.data) as JsonObject;
@@ -413,7 +428,31 @@ function LoadingRows() { return <div className="space-y-3 p-5">{[1, 2, 3].map((r
 function EmptyState() { return <div className="p-16 text-center text-sm text-slate-600">No incidents recorded yet.</div>; }
 function PanelTitle({ icon: Icon, title, meta }: { icon: LucideIcon; title: string; meta: string }) { return <div className="flex items-center justify-between"><h2 className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.12em] text-slate-300"><Icon className="h-3.5 w-3.5 text-cyan-400" />{title}</h2><span className="font-mono text-[9px] text-slate-600">{meta}</span></div>; }
 function Stat({ label, value, tone }: { label: string; value: string; tone: "rose" | "amber" | "cyan" }) { const colors = { rose: "text-rose-300", amber: "text-amber-300", cyan: "text-cyan-300" }; return <div><p className="text-[10px] uppercase tracking-wider text-slate-600">{label}</p><p className={`mt-1 font-mono text-lg ${colors[tone]}`}>{value}</p></div>; }
-function eventIcon(item: FeedEvent): LucideIcon { if (item.event === "tool_call") { const name = String(item.data.tool_name ?? ""); if (name.includes("commit")) return GitCompareArrows; if (name.includes("deployment")) return Rocket; if (name.includes("metric")) return Gauge; if (name.includes("log")) return ScrollText; if (name.includes("cluster")) return ListTree; } if (item.event === "hypothesis_update") return BrainCircuit; if (item.event === "report_ready") return CheckCircle2; if (item.event === "run_failed") return XCircle; return Activity; }
+function eventIcon(item: FeedEvent): LucideIcon { if (item.event === "tool_call") { const name = String(item.data.tool_name ?? ""); if (name.includes("commit")) return GitCompareArrows; if (name.includes("deployment")) return Rocket; if (name.includes("metric")) return Gauge; if (name.includes("log")) return ScrollText; if (name.includes("cluster")) return ListTree; } if (item.event === "tool_timeout") return TimerReset; if (item.event === "context_compacted") return FileSearch; if (item.event === "hypothesis_update") return BrainCircuit; if (item.event === "report_ready") return CheckCircle2; if (item.event === "run_failed") return XCircle; return Activity; }
 function buildChart(incident: Incident) { const start = new Date(incident.window_start ?? incident.started_at).getTime(); const end = new Date(incident.window_end ?? start + 3 * 3600000).getTime(); return Array.from({ length: 24 }, (_, index) => { const ts = new Date(start + ((end - start) * index) / 23); const value = 42 + Math.sin(index / 2.7) * 5 + (index > 15 ? (index - 14) * 8 : 0); return { ts: ts.toISOString(), label: ts.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }), value: Math.round(value) }; }); }
 
-export default App;
+type ErrorBoundaryProps = { children: ReactNode };
+type ErrorBoundaryState = { error: Error | null };
+
+class GlobalErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
+  state: ErrorBoundaryState = { error: null };
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { error };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error("Autopsy console crashed", error, info.componentStack);
+  }
+
+  retry = () => this.setState({ error: null });
+
+  render() {
+    if (!this.state.error) return this.props.children;
+    return <main className="flex min-h-screen items-center justify-center bg-slate-950 px-6 text-slate-100"><Card className="w-full max-w-md border-rose-400/20 bg-slate-900 p-6"><div className="mb-4 flex h-10 w-10 items-center justify-center rounded-lg bg-rose-400/10 text-rose-300"><AlertCircle className="h-5 w-5" /></div><p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-rose-300">Console error</p><h1 className="mt-2 text-xl font-semibold">The incident workspace hit an unexpected error.</h1><p className="mt-2 text-xs leading-relaxed text-slate-500">The page state can be reset safely. Your persisted investigation artifacts are unchanged.</p><pre className="mt-4 max-h-20 overflow-auto rounded bg-slate-950 p-3 font-mono text-[10px] text-slate-600">{this.state.error.message}</pre><Button onClick={this.retry} className="mt-5 gap-2 bg-cyan-400 text-slate-950 hover:bg-cyan-300"><Activity className="h-4 w-4" />Retry workspace</Button></Card></main>;
+  }
+}
+
+export default function RootApp() {
+  return <GlobalErrorBoundary><App /></GlobalErrorBoundary>;
+}
