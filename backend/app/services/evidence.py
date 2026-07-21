@@ -58,7 +58,7 @@ async def run_tool_with_artifact(
             {"error": str(exc), "error_type": type(exc).__name__},
             summary or "Tool call failed",
         )
-        raise ToolExecutionError(str(exc), artifact) from exc
+        raise ToolExecutionError(str(exc), artifact, exc) from exc
     artifact = record_artifact(session, run_id, tool_name, input_json, output, summary)
     return output, artifact
 
@@ -79,6 +79,7 @@ async def run_tool(
 
 
 class ToolExecutionError(RuntimeError):
-    def __init__(self, message: str, artifact: EvidenceArtifact) -> None:
+    def __init__(self, message: str, artifact: EvidenceArtifact, cause: Exception | None = None) -> None:
         super().__init__(message)
         self.artifact = artifact
+        self.cause = cause

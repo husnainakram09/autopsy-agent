@@ -37,3 +37,42 @@ def test_incident_run_and_artifact_endpoints():
         assert incident.status_code == 200
         assert incident.json()["incident"]["title"] == "Checkout latency"
         assert incident.json()["runs"][0]["id"] == run_id
+
+
+def test_alertmanager_webhook_creates_incident_and_starts_run(monkeypatch):
+    started: list[int] = []
+
+    async def fake_start(run_id: int) -> None:
+        started.append(run_id)
+
+    monkeypatch.setattr("app.main._run_investigation", fake_start)
+    with TestClient(app) as client:
+        response = client.post(
+            "/webhooks/alertmanager",
+            json={
+                "status": "firing",
+                "alerts": [
+                    {
+                        "status": "firing",
+                        "labels": {"alertname": "OrdersHighErrorRate", "service": "orders"},
+                        "annotations": {"summary": "Orders error rate above 5%"},
+                        "startsAt": "2026-07-19T10:00:00Z",
+                    }
+                ],
+            },
+        )
+        assert response.status_code == 202
+        body = response.json()
+        assert body["status"] == "accepted"
+        assert body["incident_id"]
+        assert body["run_id"] in started
+
+
+def test_alertmanager_webhook_ignores_resolved_alerts():
+    with TestClient(app) as client:
+        response = client.post(
+            "/webhooks/alertmanager",
+            json={"status": "resolved", "alerts": [{"status": "resolved"}]},
+        )
+        assert response.status_code == 202
+        assert response.json()["status"] == "ignored"

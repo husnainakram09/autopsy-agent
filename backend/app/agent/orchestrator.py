@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from collections.abc import AsyncIterator
@@ -7,6 +8,7 @@ from datetime import datetime
 from typing import Any
 
 from openai import AsyncOpenAI
+import httpx
 from pydantic import BaseModel, ConfigDict, Field
 from sqlmodel import Session, select
 
@@ -51,8 +53,11 @@ often alongside database pool pressure. Do not call one the other without metric
 the relevant code diff.
 
 Start by stating a concise plan, but the first evidence-gathering action must establish
-the metric window. Revise hypotheses when evidence contradicts them. End only by calling
-submit_report with a complete structured report. Every evidence ID in the report must
+the metric window. If a tool times out, treat the timeout as an observed limitation,
+record it in your reasoning, and proceed with partial evidence using another signal;
+never stall waiting for the same tool indefinitely. Revise hypotheses when evidence
+contradicts them. End only by calling submit_report with a complete structured report.
+Every evidence ID in the report must
 refer to a prior, non-report artifact returned by a tool call in this run.
 """
 SYSTEM_PROMPT = INVESTIGATION_POLICY
@@ -205,6 +210,8 @@ class InvestigationOrchestrator:
         event_hub: RunEventHub | None = None,
         model: str | None = None,
         max_iterations: int = 25,
+        watchdog_seconds: float = 300.0,
+        conversation_token_threshold: int = 24000,
     ) -> None:
         self.openai = openai_client or AsyncOpenAI()
         self.github = github_client or GitHubClient()
@@ -213,6 +220,8 @@ class InvestigationOrchestrator:
         self.event_hub = event_hub or run_event_hub
         self.model = model or os.getenv("OPENAI_MODEL", "gpt-5.6")
         self.max_iterations = min(max(1, max_iterations), 25)
+        self.watchdog_seconds = watchdog_seconds
+        self.conversation_token_threshold = conversation_token_threshold
 
     async def close(self) -> None:
         await self.github.close()
@@ -221,6 +230,36 @@ class InvestigationOrchestrator:
         await self.openai.close()
 
     async def investigate(
+        self,
+        session: Session,
+        incident: Incident,
+        run: InvestigationRun,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Run an investigation with a hard watchdog and partial-report salvage."""
+        try:
+            async with asyncio.timeout(self.watchdog_seconds):
+                async for event in self._investigate(session, incident, run):
+                    yield event
+        except TimeoutError:
+            report, artifact = self._salvage_partial_report(session, run)
+            yield await self._emit(
+                run.id,
+                "tool_summary",
+                {
+                    "tool_name": "watchdog",
+                    "artifact_id": artifact.id,
+                    "summary": "Five-minute watchdog stopped the run; partial evidence was salvaged.",
+                },
+            )
+            yield await self._emit(
+                run.id,
+                "report_submitted",
+                {"partial": True, "artifact_id": artifact.id, "report": report},
+            )
+        finally:
+            await self.close()
+
+    async def _investigate(
         self,
         session: Session,
         incident: Incident,
@@ -248,6 +287,12 @@ class InvestigationOrchestrator:
 
         try:
             for iteration in range(self.max_iterations):
+                if await self._compact_conversation(conversation):
+                    yield await self._emit(
+                        run.id,
+                        "context_compacted",
+                        {"message": "Conversation context was summarized to stay within the token budget."},
+                    )
                 response = await self.openai.responses.create(
                     model=self.model,
                     instructions=SYSTEM_PROMPT,
@@ -398,7 +443,24 @@ class InvestigationOrchestrator:
                         )
                     except ToolExecutionError as exc:
                         artifact = exc.artifact
-                        result = {"error": str(exc), "artifact_id": artifact.id}
+                        timed_out = isinstance(exc.cause, (httpx.TimeoutException, TimeoutError))
+                        result = {
+                            "error": str(exc),
+                            "artifact_id": artifact.id,
+                            "timed_out": timed_out,
+                            "partial_evidence": True,
+                            "next_step": "Proceed with partial evidence and test the hypothesis using another signal.",
+                        }
+                        if timed_out:
+                            yield await self._emit(
+                                run.id,
+                                "tool_timeout",
+                                {
+                                    "tool_name": name,
+                                    "artifact_id": artifact.id,
+                                    "summary": "Tool timed out; the agent should proceed with partial evidence.",
+                                },
+                            )
                         yield await self._emit(
                             run.id,
                             "tool_summary",
@@ -424,12 +486,12 @@ class InvestigationOrchestrator:
                             ),
                         }
                     )
-            run.status = "failed"
-            session.add(run)
-            session.commit()
-            yield await self._emit(run.id, "run_failed", {"reason": "Maximum tool-call iterations reached."})
-        finally:
-            await self.close()
+        except asyncio.CancelledError:
+            raise
+        run.status = "failed"
+        session.add(run)
+        session.commit()
+        yield await self._emit(run.id, "run_failed", {"reason": "Maximum tool-call iterations reached."})
 
     async def _dispatch(self, name: str, arguments: dict[str, Any]) -> Any:
         if name == "get_recent_commits":
@@ -449,6 +511,76 @@ class InvestigationOrchestrator:
         if name == "cluster_errors":
             return {"clusters": cluster_errors(arguments["entries"])}
         raise ValueError(f"Unknown investigation tool: {name}")
+
+    async def _compact_conversation(self, conversation: list[Any]) -> bool:
+        estimated_tokens = len(json.dumps(conversation, default=str, separators=(",", ":"))) // 4
+        if estimated_tokens <= self.conversation_token_threshold:
+            return False
+        raw_context = json.dumps(conversation, default=str, separators=(",", ":"))
+        try:
+            response = await self.openai.responses.create(
+                model=self.model,
+                instructions=(
+                    "Summarize this SRE investigation context compactly. Preserve artifact IDs, "
+                    "metric-window facts, hypotheses, disconfirming tests, and unresolved questions."
+                ),
+                input=[{"role": "user", "content": raw_context}],
+                tools=[],
+            )
+            summary = getattr(response, "output_text", "") or "Context summary unavailable."
+        except Exception:
+            summary = "Prior context was compacted locally; rely on the persisted artifact IDs below."
+        conversation[:] = [
+            {"role": "user", "content": f"COMPACTED INVESTIGATION CONTEXT:\n{summary}"},
+            *conversation[-6:],
+        ]
+        return True
+
+    def _salvage_partial_report(
+        self,
+        session: Session,
+        run: InvestigationRun,
+    ) -> tuple[dict[str, Any], EvidenceArtifact]:
+        prior_ids = [
+            artifact_id
+            for artifact_id in session.exec(
+                select(EvidenceArtifact.id).where(EvidenceArtifact.run_id == run.id)
+            ).all()
+            if artifact_id is not None
+        ]
+        report = {
+            "timeline": [],
+            "hypotheses": [],
+            "postmortem": {
+                "summary": "Investigation stopped by the five-minute watchdog; this is a partial report.",
+                "impact": "Impact remains unconfirmed from the evidence gathered so far.",
+                "root_cause": "Root cause remains unconfirmed; review the cited artifacts before taking action.",
+                "evidence_ids": prior_ids,
+                "contributing_factors": [],
+                "detection_gaps": ["Investigation exceeded the run watchdog window."],
+                "action_items": ["Resume investigation using the salvaged artifacts."],
+            },
+        }
+        artifact = record_artifact(
+            session,
+            run.id,
+            "watchdog",
+            {"watchdog_seconds": self.watchdog_seconds},
+            report,
+            "Partial report salvaged after watchdog timeout.",
+        )
+        finding = Finding(
+            run_id=run.id,
+            kind="partial_incident_report",
+            content_json=report,
+            confidence=0.0,
+            evidence_ids=prior_ids,
+        )
+        session.add(finding)
+        run.status = "timed_out"
+        session.add(run)
+        session.commit()
+        return report, artifact
 
     @staticmethod
     def _validate_report(

@@ -1,0 +1,16 @@
+groups:
+  - name: orders-slo
+    rules:
+      - alert: OrdersHighErrorRate
+        expr: |
+          sum(rate(http_requests_total{job="orders",status=~"5.."}[2m]))
+            /
+          clamp_min(sum(rate(http_requests_total{job="orders"}[2m])), 0.001)
+            > 0.05
+        for: 2m
+        labels:
+          severity: critical
+          service: orders
+        annotations:
+          summary: Orders error rate above 5%
+          description: The orders service has returned more than 5% errors for two minutes.

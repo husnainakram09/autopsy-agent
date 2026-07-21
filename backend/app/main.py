@@ -1,16 +1,18 @@
 from contextlib import asynccontextmanager
 from datetime import datetime
 import json
+from typing import Any
 
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import Field, Session, SQLModel, select
 from sse_starlette.sse import EventSourceResponse, ServerSentEvent
 
 from .agent.events import run_event_hub
-from .db import create_db_and_tables, get_session
+from .agent.orchestrator import InvestigationOrchestrator
+from .db import create_db_and_tables, engine, get_session
 from .models import EvidenceArtifact, Incident, InvestigationRun
 
 
@@ -52,6 +54,13 @@ class ArtifactCreate(SQLModel):
     summary: str = ""
 
 
+class WebhookResponse(SQLModel):
+    status: str
+    incident_id: int | None = None
+    run_id: int | None = None
+    alert_name: str | None = None
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -89,6 +98,80 @@ def create_run(incident_id: int, payload: InvestigationRunCreate, session: Sessi
     session.commit()
     session.refresh(run)
     return run
+
+
+async def _run_investigation(run_id: int) -> None:
+    """Consume the agent stream in the background for webhook-triggered runs."""
+    with Session(engine) as session:
+        run = session.get(InvestigationRun, run_id)
+        if run is None:
+            return
+        incident = session.get(Incident, run.incident_id)
+        if incident is None:
+            run.status = "failed"
+            session.add(run)
+            session.commit()
+            return
+
+        orchestrator = InvestigationOrchestrator()
+        try:
+            async for _ in orchestrator.investigate(session, incident, run):
+                pass
+        except Exception as exc:  # pragma: no cover - last-resort background guard
+            run.status = "failed"
+            session.add(run)
+            session.commit()
+            await run_event_hub.publish(run_id, "run_failed", {"reason": str(exc)})
+
+
+def _alert_datetime(value: Any, fallback: datetime) -> datetime:
+    if not isinstance(value, str) or not value:
+        return fallback
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return fallback
+
+
+@app.post("/webhooks/alertmanager", response_model=WebhookResponse, status_code=status.HTTP_202_ACCEPTED)
+def alertmanager_webhook(
+    payload: dict[str, Any],
+    background_tasks: BackgroundTasks,
+    session: SessionDep,
+) -> WebhookResponse:
+    """Turn a firing Alertmanager/Grafana alert into an incident and agent run."""
+    alerts = payload.get("alerts")
+    if not isinstance(alerts, list) or not alerts:
+        raise HTTPException(status_code=400, detail="Alert payload must contain at least one alert")
+
+    alert = next((item for item in alerts if isinstance(item, dict) and item.get("status", "firing") == "firing"), None)
+    if alert is None:
+        return WebhookResponse(status="ignored", alert_name="resolved")
+
+    labels = alert.get("labels") if isinstance(alert.get("labels"), dict) else {}
+    annotations = alert.get("annotations") if isinstance(alert.get("annotations"), dict) else {}
+    now = datetime.now().astimezone()
+    started_at = _alert_datetime(alert.get("startsAt"), now)
+    alert_name = str(labels.get("alertname") or labels.get("alert_name") or "Alertmanager alert")
+    service = labels.get("service") or labels.get("job")
+    title = str(annotations.get("summary") or f"{alert_name}{f' ({service})' if service else ''}")
+    incident = Incident(
+        title=title,
+        started_at=started_at,
+        window_start=started_at,
+        window_end=_alert_datetime(alert.get("endsAt"), now) if alert.get("endsAt") else None,
+        status="open",
+    )
+    session.add(incident)
+    session.commit()
+    session.refresh(incident)
+
+    run = InvestigationRun(incident_id=incident.id, status="running")
+    session.add(run)
+    session.commit()
+    session.refresh(run)
+    background_tasks.add_task(_run_investigation, run.id)
+    return WebhookResponse(status="accepted", incident_id=incident.id, run_id=run.id, alert_name=alert_name)
 
 
 @app.get("/runs/{run_id}/artifacts", response_model=list[EvidenceArtifact])
